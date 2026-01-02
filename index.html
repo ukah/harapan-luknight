@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>パンチアニメ（クリックで再生）</title>
+    <style>
+        /* 画像を真ん中に配置するスタイル */
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #f0f0f0;
+            margin: 0;
+            font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+        }
+        #punch-char {
+            cursor: pointer; /* マウスを乗せると指アイコンになる */
+            width: 320px;    /* 画像のサイズ（必要に応じて調整） */
+            user-select: none;
+            -webkit-user-drag: none;
+        }
+        .hint {
+            position: absolute;
+            bottom: 24px;
+            font-size: 14px;
+            color: #444;
+        }
+        /* HUD */
+        #hud {
+            position: fixed;
+            top: 14px;
+            right: 18px;
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            z-index: 30;
+            font-weight: 600;
+            color: #222;
+        }
+        #hud .score, #hud .combo {
+            background: rgba(255,255,255,0.9);
+            padding: 6px 10px;
+            border-radius: 8px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+            font-size: 14px;
+        }
+
+        /* フローティングヒット表示 */
+        .hit-float {
+            position: fixed;
+            left: 0;
+            top: 0;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            font-weight: 700;
+            color: #ff4444;
+            text-shadow: 0 1px 0 rgba(0,0,0,0.2);
+            animation: floatUp 700ms ease-out forwards;
+            z-index: 40;
+        }
+        @keyframes floatUp {
+            from { opacity: 1; transform: translate(-50%, -50%) translateY(0) scale(1); }
+            to   { opacity: 0; transform: translate(-50%, -50%) translateY(-48px) scale(1.15); }
+        }
+
+        /* 画像を短くバウンドさせる */
+        .hit-bounce {
+            transition: transform 120ms ease-out;
+            transform: translateY(-8px) scale(1.02);
+        }
+        .credit {
+            position: absolute;
+            bottom: 8px;
+            left: 12px;
+            font-size: 12px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- GIFファイル（punch.gif）をこのフォルダに置いてください。静止画は自動生成します。 -->
+    <img id="punch-char" src="" alt="キャラクター">
+    <div class="hint">画像をクリックするとパンチアニメが再生されます（右クリック、Space / Enter でもパンチ）</div>
+
+    <!-- HUD -->
+    <div id="hud">
+        <div class="score">Score: <span id="score">0</span></div>
+        <div class="combo">Combo: <span id="combo">0</span></div>
+    </div>
+
+    <!-- クレジット -->
+    <div class="credit">アニメーション素材: <a href="https://x.com/Moroyama_Qten/status/1883919691506409721" target="_blank" rel="noopener">@Moroyama_Qten</a> よりお借りしました。ありがとうございます。</div>
+
+    <script>
+        const img = document.getElementById('punch-char');
+
+        // ★必要に応じてファイル名と再生時間を変更してください
+        const gifImage    = "punch.gif";        // 再生するGIF
+        const gifDuration = 500;                // GIFの長さ（ミリ秒）
+
+        // --- ゲーム変数 ---
+        let score = 0;
+        let combo = 0;
+        let lastHitAt = 0; // コンボ判定用
+
+        // アニメーション（GIF表示）制御
+        let isPlaying = false;
+        let animTimeout = null;
+        let lastClickAt = 0; // 連打で再生を持続するための最終クリック時刻
+
+        // Audio 関連
+        // AudioContext を使い回す
+        let audioCtx = null;
+        // SE 用のファイルと簡易プール（重ね再生対応）
+        const seFile = 'punch.mp3';
+        let sePool = null;
+        let sePoolIdx = 0;
+        const sePoolSize = 6; // 同時に鳴らせる数
+        let staticDataUrl = null; // GIFの1フレーム目をPNG化したdata URL
+
+        // GIFを読み込み、未パンチ時に表示する静止画を用意する
+        // まず `punch-stand.png`（2フレーム目相当）を優先して読み込み、存在しなければ
+        // GIFの1フレーム目をキャンバスに描画してフォールバックします。
+        const standImage = "punch-stand.png"; // ここに2フレーム目相当の静止画を置いてください
+
+        function loadImagePromise(src) {
+            return new Promise((resolve, reject) => {
+                const i = new Image();
+                i.onload = () => resolve(i);
+                i.onerror = () => reject(new Error('load error'));
+                i.src = src + "?t=" + new Date().getTime();
+            });
+        }
+
+        function createStaticFromGif() {
+            // 1) 先に standImage を試す
+            loadImagePromise(standImage).then((stand) => {
+                // 表示用はクエリなしのファイルパスを使う（常に未パンチ表示として安定させる）
+                staticDataUrl = standImage;
+                img.src = staticDataUrl;
+            }).catch(() => {
+                // 2) standImage が無ければ GIF の最初のフレームをキャンバスに描画して使う
+                const temp = new Image();
+                // 同一オリジンであれば crossOrigin は不要。必要に応じて設定してください。
+                // temp.crossOrigin = 'anonymous';
+                temp.src = gifImage + "?t=" + new Date().getTime();
+
+                temp.onload = () => {
+                    try {
+                        const canvas = document.createElement('canvas');
+                        canvas.width = temp.naturalWidth || temp.width;
+                        canvas.height = temp.naturalHeight || temp.height;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(temp, 0, 0);
+                        staticDataUrl = canvas.toDataURL('image/png');
+                        img.src = staticDataUrl;
+                    } catch (e) {
+                        console.warn('キャンバス描画に失敗しました。静止画の生成をスキップします。', e);
+                    }
+                };
+
+                temp.onerror = () => {
+                    console.warn('GIFの読み込みに失敗しました。静止画の生成をスキップします。');
+                };
+            });
+        }
+
+        // 初回はGIFの1フレーム目を静止画化して表示
+        createStaticFromGif();
+
+        // シンプルなSEプールを初期化（存在確認は再生時に失敗でフォールバック）
+        function initSePool() {
+            try {
+                sePool = [];
+                for (let i = 0; i < sePoolSize; i++) {
+                    const a = new Audio(seFile);
+                    a.preload = 'auto';
+                    a.volume = 0.05; // 5% 音量
+                    sePool.push(a);
+                }
+            } catch (e) {
+                sePool = null;
+            }
+        }
+        initSePool();
+
+        // 共通のトリガー処理（クリック／右クリック／キー押下から呼ぶ）
+        function triggerHit(ev) {
+            onHit(ev);
+
+            // 最終クリック時刻を更新
+            lastClickAt = Date.now();
+
+            // GIFを開始（未再生時のみ切り替えして再生を開始）
+            if (!isPlaying) {
+                isPlaying = true;
+                img.src = gifImage + "?t=" + new Date().getTime();
+            }
+
+            // タイマーを毎回リセットして、最後のクリックから `gifDuration` 経過で停止するようにする
+            if (animTimeout) clearTimeout(animTimeout);
+            animTimeout = setTimeout(() => {
+                if (Date.now() - lastClickAt >= gifDuration) {
+                    if (staticDataUrl) img.src = staticDataUrl;
+                    isPlaying = false;
+                    animTimeout = null;
+                }
+            }, gifDuration);
+        }
+
+        // 左クリック
+        img.addEventListener('click', (e) => triggerHit(e));
+
+        // 右クリック（コンテキストメニュー）を無効にしてヒット処理
+        img.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            triggerHit(e);
+        });
+
+        // キーボード: Space / Enter でヒット（フォーカスに依存せず動かす）
+        document.addEventListener('keydown', (e) => {
+            const key = e.code || e.key;
+            if (key === 'Space' || key === 'Spacebar' || key === ' ' || key === 'Enter') {
+                e.preventDefault();
+                // クリック位置情報が必要なら中央を渡す
+                triggerHit({ clientX: window.innerWidth / 2, clientY: window.innerHeight / 2 });
+            }
+        });
+
+        // タッチ操作でも働くようにする
+        img.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            img.click();
+        }, {passive:false});
+
+        // --- HUD 更新とエフェクト ---
+        const scoreEl = document.getElementById('score');
+        const comboEl = document.getElementById('combo');
+
+        function updateHud() {
+            scoreEl.textContent = String(score);
+            comboEl.textContent = String(combo);
+        }
+
+        function playPunchSound() {
+            // まずSEプールを使って再生（HTMLAudio）。音量は 0.05 (5%) に設定。
+            if (sePool && sePool.length) {
+                const a = sePool[sePoolIdx];
+                sePoolIdx = (sePoolIdx + 1) % sePool.length;
+                try {
+                    a.pause();
+                    a.currentTime = 0;
+                    a.volume = 0.05;
+                    a.play().catch(() => {
+                        // 再生失敗したらフォールバックに任せる
+                    });
+                    return;
+                } catch (e) {
+                    // 失敗したら下の WebAudio にフォールバック
+                }
+            }
+
+            // AudioContext を再利用して簡易サウンドを鳴らす（フォールバック）
+            try {
+                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const ctx = audioCtx;
+                const o = ctx.createOscillator();
+                const g = ctx.createGain();
+                o.type = 'square';
+                o.frequency.setValueAtTime(220, ctx.currentTime);
+                g.gain.setValueAtTime(0.0001, ctx.currentTime);
+                // WebAudio の出力ゲインは 0.05 相当に下げる
+                g.gain.exponentialRampToValueAtTime(0.05 * 0.12, ctx.currentTime + 0.01);
+                g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.12);
+                o.connect(g); g.connect(ctx.destination);
+                o.start();
+                o.stop(ctx.currentTime + 0.12);
+            } catch (e) {
+                // AudioContext が使えない場合は無音でフォールバック
+            }
+        }
+
+        function showHitFloat(x, y, text) {
+            const el = document.createElement('div');
+            el.className = 'hit-float';
+            el.textContent = text;
+            el.style.left = x + 'px';
+            el.style.top = y + 'px';
+            document.body.appendChild(el);
+            setTimeout(() => el.remove(), 750);
+        }
+
+        function onHit(ev) {
+            const now = Date.now();
+            if (now - lastHitAt < 600) {
+                combo += 1;
+            } else {
+                combo = 1;
+            }
+            lastHitAt = now;
+
+            score += 1;
+            updateHud();
+
+            // 視覚フィードバック: クリック座標に+1を表示。イベントがなければ画像中央。
+            let x = window.innerWidth / 2;
+            let y = window.innerHeight / 2;
+            if (ev && ev.clientX) {
+                x = ev.clientX;
+                y = ev.clientY;
+            } else {
+                const r = img.getBoundingClientRect();
+                x = r.left + r.width/2;
+                y = r.top + r.height/2;
+            }
+            showHitFloat(x, y, '+1');
+
+            // 画像の短いバウンス
+            img.classList.add('hit-bounce');
+            setTimeout(() => img.classList.remove('hit-bounce'), 140);
+
+            // サウンド
+            playPunchSound();
+        }
+    </script>
+</body>
+</html>
+
